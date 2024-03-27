@@ -7,14 +7,6 @@ readonly APK2_PATH="${2}"
 readonly OUTPUT_FILE="${3}"
 readonly DEBUG_FILE="/tmp/bashapkdiff.log"
 readonly TEMP_DIR="bashapkdiff_tmp"
-# to make this work we need to:
-# 1. unzip apks to dirs
-# 2. unpack all classes folders with jadx
-# 3. arrange them in single folder with sources
-# 4. diff one by one
-# 5. profit
-#
-#
 
 # prints debug message to stdout
 _DEBUG()
