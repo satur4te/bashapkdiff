@@ -2,17 +2,22 @@
 
 readonly SUCCESS=0
 readonly ERROR=1
+readonly DEBUG="set"
 readonly APK1_PATH="${1}"
 readonly APK2_PATH="${2}"
-readonly OUTPUT_FILE="${3}"
+readonly OUTPUT_DIR="${3}"
 readonly DEBUG_FILE="/tmp/bashapkdiff.log"
 readonly TEMP_DIR="bashapkdiff_tmp"
+CURRENT_COLUMNS=""
+CLEAR_STRING="" 
 
 # prints debug message to stdout
 _DEBUG()
 {
-    local -r msg="${1}"
-    echo "[[ $(caller 0) ]]:  ${1}" >> ${DEBUG_FILE}
+    if [[ "${DEBUG}" == "set" ]]; then
+        local -r msg="${1}"
+        echo "[[ $(caller 0) ]]:  ${1}" >> ${DEBUG_FILE}
+    fi
 }
 
 # prints user message to stdout
@@ -24,16 +29,34 @@ _MSG()
 # prints progress (commands are on the same line)
 _PROGRESS()
 {
-    local -r msg="${1}"
+    if [[ "${CURRENT_COLUMNS}" != "${COLUMNS}" ]]; then
+        CURRENT_COLUMNS="${COLUMNS}"
+        CLEAR_STRING=""
+        for i in $(seq 1 ${COLUMNS}); do
+            CLEAR_STRING+=" "
+        done
+    fi
 
-    echo -ne "${1}\r"
+    local -r msg="${1}"
+    echo -ne "${CLEAR_STRING}\r"
+    echo -ne "${msg:0:${CURRENT_COLUMNS}}\r"
+    
+}
+
+_PRINT_ARRAY()
+{
+    declare -a input_array=("${!1}")
+    local -r file_path="${2}"
+    for entry in ${input_array[@]}; do
+        echo "${entry}" >> ${file_path}
+    done
 }
 
 
 # prints to output_file
 _OUTPUT()
 {
-    echo -e "${1}" >> ${OUTPUT_FILE}
+    echo -e "${1}" >> ${OUTPUT_DIR}/global_res.txt
 }
 
 # processes last command's exit code and exits with message if not SUCCESS
@@ -106,7 +129,7 @@ _ARRANGE_DEX_CLASSES()
         local dex_output_dir="${dex%????}"
         _PROGRESS "Decompiling: ${dex}"
         # ignore jadx's result
-        jadx -q --output-dir ${dex_output_dir} ${dex}
+        jadx -q --show-bad-code --output-dir ${dex_output_dir} ${dex}
         
         cp -r ${dex_output_dir}/sources/* "${output_dir}"
         _E_PROCESS "couldn't copy jadx results"
@@ -117,82 +140,137 @@ _ARRANGE_DEX_CLASSES()
     return ${SUCCESS}
 }
 
-# diffs sources and writes results to OUTPUT_FILE
-# arguments:
-#   1. path to sources of apk1
-#   2. path to sources of apk2
-_DIFF_DECOMPILED()
+# Diffs all files in specified directories
+# Sets DIFF1_DIR1_FILES and DIFF_DIR2_FILES with all files in according directories
+# If file_path exists in both directories and they are identical,
+#+ file_path is saved in DIFF_SHARED_IDENTICAL
+# If file_path exists in both directories and they are different,
+#+ file_path is saved in DIFF_SHARED_DIFFERENT
+# Writes resultive diffs to output_file_path 
+# Important! Arrays are filled with relative file paths!
+# DIFF_DIR1_UNIQUE and DIFF_DIR2_UNIQUE computed in the end
+# Globals:
+#   writes DIFF_DIR1_FILES       -> array of strings
+#   writes DIFF_DIR2_FILES       -> array of strings
+#   writes DIFF_DIR1_UNIQUE      -> array of strings
+#   writes DIFF_DIR2_UNIQUE      -> array of strings
+#   writes DIFF_SHARED_IDENTICAL -> array of strings
+#   writes DIFF_SHARED_DIFFERENT -> array of strings
+# Arguments:
+#   1. Path to dir1              -> string
+#   2. Path to dir2              -> string
+#   3. Path to output file       -> string
+_DIFF_DIRS()
 {
-    local -r apk1_dir="${1}"
-    local -r apk2_dir="${2}"
-    if [[ ! -d ${apk1_dir} ]]; then
-        _DEBUG "missing apk1 dir"
+    local -r dir1_dir="${1}"
+    local -r dir2_dir="${2}"
+    local -r output_dir="${3}"
+    local -r output_diff_path="${output_dir}/diff_output.txt"
+    
+    if [[ ! -d "${dir1_dir}" ]]; then
+        _DEBUG "Missing ${dir1_dir} dir"
         return ${ERROR}
-    elif [[ ! -d ${apk2_dir} ]]; then
-        _DEBUG "missing apk2 dir"
+    elif [[ ! -d "${dir2_dir}" ]]; then
+        _DEBUG "Missing ${dir2_dir} dir"
         return ${ERROR}
     fi
     
-    _DEBUG "Arranging apk1_files array"
-    cd ${apk1_dir}
-    apk1_files=($(find . -type f))
-    cd - > /dev/null
-
-    _DEBUG "Arranging apk2_files array"
-    cd ${apk2_dir}
-    apk2_files=($(find . -type f))
-    cd - > /dev/null
-
-    # save lengths for stats
-    local -r apk1_files_count="${#apk1_files[@]}"
-    local -r apk2_files_count="${#apk2_files[@]}"
-    local apk_shared_files=()
-
-    if [[ ${#apk1_files[@]} == 0 ]]; then 
-        _DEBUG "no files found in apk1_dir"
-        return ${ERROR}
-    elif [[ ${#apk2_files[@]} == 0 ]]; then
-        _DEBUG "no files found in apk2_dir"
+    if [[ -d "${output_dir}" ]]; then
+        _DEBUG "${output_dir} exists"
         return ${ERROR}
     fi
     
-    local apk_shared_count=0
-    local apk_shared_identical_count=0
-    local apk1_unique_count=0
-    local apk2_unique_count=0
+    mkdir "${output_dir}"
+    _E_PROCESS "Couldn't create ${output_dir}"
 
-    DIFF_OUTPUT_PATH="${TEMP_DIR}/diff_temp"
-    for file_path in ${apk1_files[@]}; do
+    _DEBUG "Arranging DIFF_DIR1_FILES array"
+    cd "${dir1_dir}"
+    _E_PROCESS "cd failed"
+
+    DIFF_DIR1_FILES=($(find . -type f))
+    cd - > /dev/null
+
+    _DEBUG "arranging DIFF_DIR2_FILES array"
+    cd "${dir2_dir}"
+    _E_PROCESS "cd failed"
+
+    DIFF_DIR2_FILES=($(find . -type f))
+    cd - > /dev/null
+
+    if [[ ${#DIFF_DIR1_FILES[@]} == 0 ]]; then
+        _DEBUG "no files found in dir1_dir"
+        return ${ERROR}
+    elif [[ ${#DIFF_DIR2_FILES[@]} == 0 ]]; then
+        _DEBUG "no files found in dir2_dir"
+        return ${ERROR}
+    fi
+    
+    local diff_output_path="${TEMP_DIR}/diff_temp"
+    DIFF_SHARED_IDENTICAL=()
+    DIFF_SHARED_DIFFERENT=()
+
+    _MSG "Initiated diff for ${dir1_dir} and ${dir2_dir} directories"
+    for file_path in ${DIFF_DIR1_FILES[@]}; do
         _PROGRESS "Diffing ${file_path}"
         
-        diff "${apk1_dir}/${file_path}" "${apk2_dir}/${file_path}" > ${DIFF_OUTPUT_PATH} 
+        diff "${dir1_dir}/${file_path}" \
+             "${dir2_dir}/${file_path}" > ${diff_output_path}
         local res="${?}"
 
         if [[ "${res}" == "2" ]]; then
-            _DEBUG "${file_path} is missing in some apk"
-            apk1_unique_count=$(( ${apk1_unique_count} + 1 ))
+            _DEBUG "${file_path} not found in dir2"
         elif [[ "${res}" == "1" ]]; then
-            _DEBUG "${file_path} are different for apks, diff initiated"
-            apk_shared_count=$(( ${apk_shared_count} + 1 ))
-            _OUTPUT "### DIFF RESULT FOR ${file_path} ###"
-            cat ${DIFF_OUTPUT_PATH} >> ${OUTPUT_FILE}
+            _DEBUG "${file_path} differs"
+            DIFF_SHARED_DIFFERENT+=("${file_path}")
+            cat ${diff_output_path} >> "${output_diff_path}"
         elif [[ "${res}" == "0" ]]; then
-            _DEBUG "${file_path} is identical for both apks"
-            apk_shared_count=$(( ${apk_shared_count} + 1 ))
-            apk_shared_identical_count=$(( ${apk_shared_identical_count} + 1 ))
+            _DEBUG "${file_path} is identical"
+            DIFF_SHARED_IDENTICAL+=("${file_path}")
         fi
     done
     
-    _OUTPUT "### Stats for ${APK1_PATH} ###"
-    _OUTPUT "Total decompiled files: ${apk1_files_count}"
-    _OUTPUT "Unique files: ${apk1_unique_count}"
-    _OUTPUT "### Stats for ${APK2_PATH} ###"
-    _OUTPUT "Total decompiled files: ${apk2_files_count}"
-    _OUTPUT "Unique files: $(( ${apk2_files_count} - ${apk_shared_count} ))"
+    # get unique
+    DIFF_DIR1_UNIQUE=($(echo ${DIFF_DIR1_FILES[@]} \
+                 ${DIFF_SHARED_DIFFERENT[@]} \
+                 ${DIFF_SHARED_IDENTICAL[@]}\
+                 | tr ' ' '\n' \
+                 | sort \
+                 | uniq -u))
+    
+    DIFF_DIR2_UNIQUE=($(echo ${DIFF_DIR2_FILES[@]} \
+                 ${DIFF_SHARED_DIFFERENT[@]} \
+                 ${DIFF_SHARED_IDENTICAL[@]}\
+                 | tr ' ' '\n' \
+                 | sort \
+                 | uniq -u))
+
+    _OUTPUT "###### DIFF RES FOR ${dir1_dir} and ${dir2_dir} ######" 
+    _OUTPUT "### Stats for ${dir1_dir} ###"
+    _OUTPUT "Total decompiled files: ${#DIFF_DIR1_FILES[@]}"
+    _OUTPUT "Unique files: ${#DIFF_DIR1_UNIQUE[@]}"
+    _OUTPUT "### Stats for ${dir2_dir} ###"
+    _OUTPUT "Total decompiled files: ${#DIFF_DIR2_FILES[@]}"
+    _OUTPUT "Unique files: ${#DIFF_DIR2_UNIQUE[@]}"
     _OUTPUT "### Shared stats ###"
-    _OUTPUT "Shared files: ${apk_shared_count}"
-    _OUTPUT "Identical files in shared: ${apk_shared_identical_count}"
-    _OUTPUT "Different files in shared: $(( ${apk_shared_count} - ${apk_shared_identical_count} ))"
+    _OUTPUT "Shared files: $((${#DIFF_SHARED_DIFFERENT[@]} + ${#DIFF_SHARED_IDENTICAL[@]} ))"
+    _OUTPUT "Identical files in shared: ${#DIFF_SHARED_IDENTICAL[@]}"
+    _OUTPUT "Different files in shared: ${#DIFF_SHARED_DIFFERENT[@]}"
+    _OUTPUT "######==========================================######" 
+
+    if [[ ${#DIFF_SHARED_DIFFERENT[@]} != 0 ]]; then
+        _PRINT_ARRAY DIFF_SHARED_DIFFERENT[@] "${output_dir}/diff_shared_different.txt"
+    fi
+    if [[ ${#DIFF_SHARED_IDENTICAL[@]} != 0 ]]; then
+        _PRINT_ARRAY DIFF_SHARED_IDENTICAL[@] "${output_dir}/diff_shared_identical.txt"
+    fi
+    if [[ ${#DIFF_DIR1_UNIQUE[@]} != 0 ]]; then
+        _PRINT_ARRAY DIFF_DIR1_UNIQUE[@] "${output_dir}/diff_dir1_unique.txt"
+    fi
+    if [[ ${#DIFF_DIR2_UNIQUE[@]} != 0 ]]; then
+        _PRINT_ARRAY DIFF_DIR2_UNIQUE[@] "${output_dir}/diff_dir2_unique.txt"
+    fi
+
+    return ${SUCCESS}
 }
 
 ### EXECUTION STARTS HERE ###
@@ -212,9 +290,6 @@ then
 fi
 
 _DEBUG "Initiated bashapkdiff run ($(date))"
-# _MSG "Path to apk1: ${APK1_PATH}"
-# _MSG "Path to apk2: ${APK2_PATH}"
-# _MSG "Path to output_file: ${OUTPUT_FILE}"
 
 # defines for directory structure
 apk1_unzipped_dir="${TEMP_DIR}/${APK1_PATH%????}"
@@ -223,12 +298,15 @@ apk1_decompiled_dir="${TEMP_DIR}/${APK1_PATH%????}_decompiled"
 apk2_decompiled_dir="${TEMP_DIR}/${APK2_PATH%????}_decompiled"
 
 
-#create tmp folder
 rm -rf "${TEMP_DIR}"
-rm -rf "${OUTPUT_FILE}"
+_E_PROCESS "Failed to remove ${TEMP_DIR}"
+rm -rf "${OUTPUT_DIR}"
+_E_PROCESS "Failed to remove ${OUTPUT_DIR}"
 
-mkdir "${TEMP_DIR}"
-_E_PROCESS "Failed to create temporary folder"
+mkdir "${TEMP_DIR}" > /dev/null
+_E_PROCESS "Failed to create temporary dir"
+mkdir "${OUTPUT_DIR}" >/dev/null
+_E_PROCESS "Failed to create output dir"
 
 _UNPACK_APK "${APK1_PATH}" "${apk1_unzipped_dir}"
 _E_PROCESS "_UNPACK_APK failed for ${APK1_PATH}"
@@ -241,4 +319,5 @@ _E_PROCESS "ARRANGE_DEX_CLASSES failed for apk1"
 _ARRANGE_DEX_CLASSES "${apk1_unzipped_dir}" "${apk2_decompiled_dir}"
 _E_PROCESS "ARRANGE_DEX_CLASSES failed for apk2"
 
-_DIFF_DECOMPILED "${apk1_decompiled_dir}" "${apk2_decompiled_dir}"
+_DIFF_DIRS "${apk1_decompiled_dir}" "${apk2_decompiled_dir}" "${OUTPUT_DIR}/jadx_diff"
+
