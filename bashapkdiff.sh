@@ -4,7 +4,9 @@ readonly SUCCESS=0
 readonly ERROR=1
 readonly DEBUG="set"
 readonly APK1_PATH="${1}"
+readonly APK1_NAME="$(echo ${APK1_PATH} | sed 's/.*\///' | sed 's/\..*//')"
 readonly APK2_PATH="${2}"
+readonly APK2_NAME="$(echo ${APK2_PATH} | sed 's/.*\///' | sed 's/\..*//')"
 readonly OUTPUT_DIR="${3}"
 readonly DEBUG_FILE="/tmp/bashapkdiff.log"
 readonly TEMP_DIR="bashapkdiff_tmp"
@@ -32,7 +34,7 @@ _PROGRESS()
     if [[ "${CURRENT_COLUMNS}" != "${COLUMNS}" ]]; then
         CURRENT_COLUMNS="${COLUMNS}"
         CLEAR_STRING=""
-        for i in $(seq 1 ${COLUMNS}); do
+        for progress_counter in $(seq 1 ${COLUMNS}); do
             CLEAR_STRING+=" "
         done
     fi
@@ -125,9 +127,11 @@ _ARRANGE_DEX_CLASSES()
         return ${ERROR}
     fi
 
+    local i=1
+    local -r dex_list_size=${#dex_list[@]}
     for dex in ${dex_list[@]}; do
         local dex_output_dir="${dex%????}"
-        _PROGRESS "Decompiling: ${dex}"
+        _PROGRESS "Decompiling (${i} of ${dex_list_size}): ${dex}"
         # ignore jadx's result
         jadx -q --show-bad-code --output-dir ${dex_output_dir} ${dex}
         
@@ -135,12 +139,159 @@ _ARRANGE_DEX_CLASSES()
         _E_PROCESS "couldn't copy jadx results"
         _DEBUG "Decompiled ${dex}"
         rm -rf ${dex_output_dir}
+        i=$(( i + 1 ))
     done
     
     return ${SUCCESS}
 }
 
-# Diffs all files in specified directories
+# Compares all files in specified directories with specified mask (based on sha256 hashes)
+# Sets COMP_DIR1_FILES and COMP_DIR2_FILES with files in according directories
+# If file_path exists in both directories and their hashes natch,
+#+ file_path is saved in COMP_SHARED_IDENTICAL
+# If file_path exists in both directories and their hashes differ,
+#+ file_path is saved in DCOMP_SHARED_DIFFERENT
+# Important! Arrays are filled with relative file paths!
+# COMP_DIR1_UNIQUE and COMP_DIR2_UNIQUE computed in the end
+# Globals:
+#   writes COMP_DIR1_FILES       -> array of strings
+#   writes COMP_DIR2_FILES       -> array of strings
+#   writes COMP_DIR1_UNIQUE      -> array of strings
+#   writes COMP_DIR2_UNIQUE      -> array of strings
+#   writes COMP_SHARED_IDENTICAL -> array of strings
+#   writes COMP_SHARED_DIFFERENT -> array of strings
+# Arguments:
+#   1. Path to dir1              -> string
+#   2. Path to dir2              -> string
+#   3. Path to output file       -> string
+#   4. OPTIONAL filemask         -> string
+_COMP_DIRS()
+{
+    local -r dir1_dir="${1}"
+    local -r dir2_dir="${2}"
+    local -r output_dir="${3}"
+    local -r file_mask="${4}"
+    
+    if [[ ! -d "${dir1_dir}" ]]; then
+        _DEBUG "Missing ${dir1_dir} dir"
+        return ${ERROR}
+    elif [[ ! -d "${dir2_dir}" ]]; then
+        _DEBUG "Missing ${dir2_dir} dir"
+        return ${ERROR}
+    fi
+    
+    if [[ -d "${output_dir}" ]]; then
+        _DEBUG "${output_dir} exists"
+        return ${ERROR}
+    fi
+    
+    mkdir "${output_dir}"
+    _E_PROCESS "Couldn't create ${output_dir}"
+
+    _DEBUG "Arranging COMP_DIR1_FILES array"
+    cd "${dir1_dir}"
+    _E_PROCESS "cd failed"
+    
+    if [[ "${file_mask}" != "" ]]; then
+        COMP_DIR1_FILES=($(find . -type f -iname "${file_mask}"))
+    else
+        COMP_DIR1_FILES=($(find . -type f))
+    fi
+
+    cd - > /dev/null
+
+    _DEBUG "Arranging COMP_DIR2_FILES array"
+    cd "${dir2_dir}"
+    _E_PROCESS "cd failed"
+
+    if [[ "${file_mask}" != "" ]]; then
+        COMP_DIR2_FILES=($(find . -type f -iname "${file_mask}"))
+    else
+        COMP_DIR2_FILES=($(find . -type f))
+    fi
+    cd - > /dev/null
+
+    if [[ ${#COMP_DIR1_FILES[@]} == 0 ]]; then
+        _DEBUG "no files found in ${dir1_dir}"
+        return ${ERROR}
+    elif [[ ${#COMP_DIR2_FILES[@]} == 0 ]]; then
+        _DEBUG "no files found in ${dir2_dir}"
+        return ${ERROR}
+    fi
+    
+    COMP_SHARED_IDENTICAL=()
+    COMP_SHARED_DIFFERENT=()
+
+
+    _MSG "Initiated comp for ${dir1_dir} and ${dir2_dir} directories"
+    local i=1
+    local -r comp_dir1_files_size=${#COMP_DIR1_FILES[@]}
+    for file_path in ${COMP_DIR1_FILES[@]}; do
+        _PROGRESS "Comparing(${i} in ${comp_dir1_files_size}): ${file_path}"
+        
+        if [[ ! -f "${dir2_dir}/${file_path}" ]]; then
+            continue
+        fi
+        
+        if [[ "$(sha256sum "${dir1_dir}/${file_path}")" == \
+              "$(sha256sum "${dir2_dir}/${file_path}")" ]]
+        then
+            COMP_SHARED_IDENTICAL+=("${file_path}")
+        else
+            COMP_SHARED_DIFFERENT+=("${file_path}")
+        fi
+        i=$(( i + 1 ))
+    done
+    
+    # get unique
+    COMP_DIR1_UNIQUE=($(echo ${COMP_DIR1_FILES[@]} \
+                 ${COMP_SHARED_DIFFERENT[@]} \
+                 ${COMP_SHARED_IDENTICAL[@]}\
+                 | tr ' ' '\n' \
+                 | sort \
+                 | uniq -u))
+    
+    COMP_DIR2_UNIQUE=($(echo ${COMP_DIR2_FILES[@]} \
+                 ${COMP_SHARED_DIFFERENT[@]} \
+                 ${COMP_SHARED_IDENTICAL[@]}\
+                 | tr ' ' '\n' \
+                 | sort \
+                 | uniq -u))
+
+    if [[ "${file_mask}" != "" ]]; then
+        _OUTPUT "###### COMP RES FOR MASK [[ ${file_mask} ]] ######"
+    else
+        _OUTPUT "###### COMP RES FOR ${dir1_dir} and ${dir2_dir} ######" 
+    fi
+    _OUTPUT "### Stats for ${dir1_dir} ###"
+    _OUTPUT "Total compared files: ${#COMP_DIR1_FILES[@]}"
+    _OUTPUT "Unique files: ${#COMP_DIR1_UNIQUE[@]}"
+    _OUTPUT "### Stats for ${dir2_dir} ###"
+    _OUTPUT "Total compared files: ${#COMP_DIR2_FILES[@]}"
+    _OUTPUT "Unique files: ${#COMP_DIR2_UNIQUE[@]}"
+    _OUTPUT "### Shared stats ###"
+    _OUTPUT "Shared files: $((${#COMP_SHARED_DIFFERENT[@]} + ${#COMP_SHARED_IDENTICAL[@]} ))"
+    _OUTPUT "Identical files in shared: ${#COMP_SHARED_IDENTICAL[@]}"
+    _OUTPUT "Different files in shared: ${#COMP_SHARED_DIFFERENT[@]}"
+    _OUTPUT "######==========================================######" 
+
+    if [[ ${#COMP_SHARED_DIFFERENT[@]} != 0 ]]; then
+        _PRINT_ARRAY COMP_SHARED_DIFFERENT[@] "${output_dir}/comp_shared_different.txt"
+    fi
+    if [[ ${#COMP_SHARED_IDENTICAL[@]} != 0 ]]; then
+        _PRINT_ARRAY COMP_SHARED_IDENTICAL[@] "${output_dir}/comp_shared_identical.txt"
+    fi
+    if [[ ${#COMP_DIR1_UNIQUE[@]} != 0 ]]; then
+        _PRINT_ARRAY COMP_DIR1_UNIQUE[@] "${output_dir}/comp_${APK1_NAME}_unique.txt"
+    fi
+    if [[ ${#COMP_DIR2_UNIQUE[@]} != 0 ]]; then
+        _PRINT_ARRAY COMP_DIR2_UNIQUE[@] "${output_dir}/comp_${APK2_NAME}_unique.txt"
+    fi
+
+    return ${SUCCESS}
+}
+
+# Diffs all files in specified directories with specified mask (based on diff util)
 # Sets DIFF1_DIR1_FILES and DIFF_DIR2_FILES with all files in according directories
 # If file_path exists in both directories and they are identical,
 #+ file_path is saved in DIFF_SHARED_IDENTICAL
@@ -160,11 +311,13 @@ _ARRANGE_DEX_CLASSES()
 #   1. Path to dir1              -> string
 #   2. Path to dir2              -> string
 #   3. Path to output file       -> string
+#   4. OPTIONAL filemask         -> string
 _DIFF_DIRS()
 {
     local -r dir1_dir="${1}"
     local -r dir2_dir="${2}"
     local -r output_dir="${3}"
+    local -r file_mask="${4}"
     local -r output_diff_path="${output_dir}/diff_output.txt"
     
     if [[ ! -d "${dir1_dir}" ]]; then
@@ -186,15 +339,23 @@ _DIFF_DIRS()
     _DEBUG "Arranging DIFF_DIR1_FILES array"
     cd "${dir1_dir}"
     _E_PROCESS "cd failed"
-
-    DIFF_DIR1_FILES=($(find . -type f))
+    
+    if [[ "${file_mask}" != "" ]]; then
+        DIFF_DIR1_FILES=($(find . -type f -iname "${file_mask}"))
+    else
+        DIFF_DIR1_FILES=($(find . -type f))
+    fi
     cd - > /dev/null
 
     _DEBUG "arranging DIFF_DIR2_FILES array"
     cd "${dir2_dir}"
     _E_PROCESS "cd failed"
 
-    DIFF_DIR2_FILES=($(find . -type f))
+    if [[ "${file_mask}" != "" ]]; then
+        DIFF_DIR2_FILES=($(find . -type f -iname "${file_mask}"))
+    else
+        DIFF_DIR2_FILES=($(find . -type f))
+    fi
     cd - > /dev/null
 
     if [[ ${#DIFF_DIR1_FILES[@]} == 0 ]]; then
@@ -210,8 +371,10 @@ _DIFF_DIRS()
     DIFF_SHARED_DIFFERENT=()
 
     _MSG "Initiated diff for ${dir1_dir} and ${dir2_dir} directories"
+    local i=1
+    local -r diff_dir1_files_size=${#DIFF_DIR1_FILES[@]}
     for file_path in ${DIFF_DIR1_FILES[@]}; do
-        _PROGRESS "Diffing ${file_path}"
+        _PROGRESS "Diffing(${i} in ${diff_dir1_files_size}): ${file_path}"
         
         diff "${dir1_dir}/${file_path}" \
              "${dir2_dir}/${file_path}" > ${diff_output_path}
@@ -227,6 +390,7 @@ _DIFF_DIRS()
             _DEBUG "${file_path} is identical"
             DIFF_SHARED_IDENTICAL+=("${file_path}")
         fi
+        i=$(( i + 1 ))
     done
     
     # get unique
@@ -243,8 +407,11 @@ _DIFF_DIRS()
                  | tr ' ' '\n' \
                  | sort \
                  | uniq -u))
-
-    _OUTPUT "###### DIFF RES FOR ${dir1_dir} and ${dir2_dir} ######" 
+    if [[ "${file_mask}" != "" ]]; then
+        _OUTPUT "###### DIFF RES FOR FILEMASK ${file_mask} ######"
+    else
+        _OUTPUT "###### DIFF RES FOR ${dir1_dir} and ${dir2_dir} ######" 
+    fi
     _OUTPUT "### Stats for ${dir1_dir} ###"
     _OUTPUT "Total decompiled files: ${#DIFF_DIR1_FILES[@]}"
     _OUTPUT "Unique files: ${#DIFF_DIR1_UNIQUE[@]}"
@@ -264,10 +431,10 @@ _DIFF_DIRS()
         _PRINT_ARRAY DIFF_SHARED_IDENTICAL[@] "${output_dir}/diff_shared_identical.txt"
     fi
     if [[ ${#DIFF_DIR1_UNIQUE[@]} != 0 ]]; then
-        _PRINT_ARRAY DIFF_DIR1_UNIQUE[@] "${output_dir}/diff_dir1_unique.txt"
+        _PRINT_ARRAY DIFF_DIR1_UNIQUE[@] "${output_dir}/diff_${APK1_NAME}_unique.txt"
     fi
     if [[ ${#DIFF_DIR2_UNIQUE[@]} != 0 ]]; then
-        _PRINT_ARRAY DIFF_DIR2_UNIQUE[@] "${output_dir}/diff_dir2_unique.txt"
+        _PRINT_ARRAY DIFF_DIR2_UNIQUE[@] "${output_dir}/diff_${APK2_NAME}_unique.txt"
     fi
 
     return ${SUCCESS}
@@ -320,4 +487,9 @@ _ARRANGE_DEX_CLASSES "${apk1_unzipped_dir}" "${apk2_decompiled_dir}"
 _E_PROCESS "ARRANGE_DEX_CLASSES failed for apk2"
 
 _DIFF_DIRS "${apk1_decompiled_dir}" "${apk2_decompiled_dir}" "${OUTPUT_DIR}/jadx_diff"
+
+_COMP_DIRS "${apk1_unzipped_dir}/res" "${apk2_unzipped_dir}/res" "${OUTPUT_DIR}/res_comp"
+
+_DIFF_DIRS "${apk1_unzipped_dir}" "${apk2_unzipped_dir}" "${OUTPUT_DIR}/properties_diff" "*.properties"
+_COMP_DIRS "${apk1_unzipped_dir}/assets" "${apk2_unzipped_dir}/assets" "${OUTPUT_DIR}/assets_comp"
 
